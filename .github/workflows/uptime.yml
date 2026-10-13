@@ -1,0 +1,82 @@
+name: Uptime bubbleflow.live
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"          # every 5 minutes (GitHub may delay scheduled runs by a few minutes)
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Simulate an outage to test the alert email"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the site
+        id: check
+        run: |
+          ok=1; failed=""
+          for url in https://bubbleflow.live/ https://bubbleflow.live/healthz; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --retry 2 --retry-delay 20 --retry-all-errors "$url" || true)
+            echo "$url -> ${code:-no answer}"
+            if [ "$code" != "200" ]; then ok=0; failed="$failed $url (${code:-no answer})"; fi
+          done
+          if [ "${{ inputs.test_alert }}" = "true" ]; then ok=0; failed="TEST ALERT (simulated outage)"; fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+
+      - name: Open an incident (email to the owner)
+        if: steps.check.outputs.ok == '0'
+        uses: actions/github-script@v7
+        env:
+          FAILED: ${{ steps.check.outputs.failed }}
+        with:
+          script: |
+            const { data: open } = await github.rest.issues.listForRepo({ ...context.repo, state: "open", labels: "incident" });
+            if (open.length) return;   // already reported, no spam every 5 minutes
+            await github.rest.issues.create({
+              ...context.repo,
+              title: "🔴 bubbleflow.live is DOWN",
+              labels: ["incident"],
+              assignees: [context.repo.owner],
+              body: `The uptime check failed at ${new Date().toISOString()}.\n\nFailed: ${process.env.FAILED}\n\n` +
+                    "First steps: open https://bubbleflow.live, then on the VPS `systemctl status bubbleflow nginx` " +
+                    "and `journalctl -u bubbleflow -n 50`.\n\nThis issue closes automatically when the site is back.",
+            });
+
+      - name: Close the incident when the site is back
+        if: steps.check.outputs.ok == '1'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: open } = await github.rest.issues.listForRepo({ ...context.repo, state: "open", labels: "incident" });
+            for (const issue of open) {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: issue.number,
+                body: `🟢 Back up at ${new Date().toISOString()}.` });
+              await github.rest.issues.update({ ...context.repo, issue_number: issue.number, state: "closed" });
+            }
+
+      # GitHub disables scheduled workflows after 60 days without commits: one tiny commit per month
+      - uses: actions/checkout@v4
+        if: github.event_name == 'schedule'
+      - name: Monthly keep-alive
+        if: github.event_name == 'schedule'
+        run: |
+          month=$(date -u +%Y-%m)
+          if [ "$(cat keepalive.txt 2>/dev/null)" != "$month" ]; then
+            echo "$month" > keepalive.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add keepalive.txt && git commit -m "keep-alive $month" && git push
+          fi
