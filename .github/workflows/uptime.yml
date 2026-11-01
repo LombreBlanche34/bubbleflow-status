@@ -21,17 +21,23 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - name: Check the site
         id: check
         run: |
-          ok=1; failed=""
-          for url in https://bubbleflow.live/ https://bubbleflow.live/healthz; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --retry 2 --retry-delay 20 --retry-all-errors "$url" || true)
-            echo "$url -> ${code:-no answer}"
-            if [ "$code" != "200" ]; then ok=0; failed="$failed $url (${code:-no answer})"; fi
-          done
+          # curl exit codes: 6 = DNS failure, 7 = connection refused, 28 = timeout, 35 = TLS error
+          check() {
+            ok=1; failed=""
+            for url in https://bubbleflow.live/ https://bubbleflow.live/healthz; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --retry 2 --retry-delay 20 --retry-all-errors "$url"); rc=$?
+              echo "$url -> HTTP ${code:-none}, curl exit $rc"
+              if [ "$code" != "200" ]; then ok=0; failed="$failed $url (HTTP ${code:-none}, curl exit $rc)"; fi
+            done
+          }
+          check
+          # a blip between GitHub and the server (network, DNS) is not an outage: confirmed 3 min later
+          if [ "$ok" = "0" ]; then echo "failed, checking again in 3 min"; sleep 180; check; fi
           if [ "${{ inputs.test_alert }}" = "true" ]; then ok=0; failed="TEST ALERT (simulated outage)"; fi
           echo "ok=$ok" >> "$GITHUB_OUTPUT"
           echo "failed=$failed" >> "$GITHUB_OUTPUT"
